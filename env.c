@@ -224,8 +224,12 @@ void reset_state(SnakeENV* env) {
     env->steps = 0;
 }
 
-// Update snake coordinates based on selected action
-void take_action(SnakeENV* env, ACTION action) {
+// Resolve NONE and the anti-180-reversal rule into a concrete action, the
+// same way take_action does internally. Pulled out on its own so anything
+// that wants to know "what would actually happen" (e.g. the test-time loop
+// breaker below) can ask without duplicating -- and risking drifting from --
+// this logic.
+ACTION resolve_action(SnakeENV* env, ACTION action) {
     if (action == NONE) {
         action = env->pov;
     }
@@ -237,6 +241,27 @@ void take_action(SnakeENV* env, ACTION action) {
         (action == DOWN && env->pov == UP)) {
         action = env->pov;
     }
+
+    return action;
+}
+
+// Where would the head end up if `action` were resolved and applied right
+// now? Pure/read-only -- does not touch env.
+State peek_next_head(SnakeENV* env, ACTION action) {
+    action = resolve_action(env, action);
+
+    State next = env->snake;
+    if (action == LEFT)       next.x -= 1;
+    else if (action == RIGHT) next.x += 1;
+    else if (action == UP)    next.y += 1;
+    else if (action == DOWN)  next.y -= 1;
+
+    return next;
+}
+
+// Update snake coordinates based on selected action
+void take_action(SnakeENV* env, ACTION action) {
+    action = resolve_action(env, action);
 
     // Apply any growth queued up by eating food last step. Extending the
     // length BEFORE the shift below means the shift loop also fills the new
@@ -262,6 +287,7 @@ void take_action(SnakeENV* env, ACTION action) {
 
     env->body[0] = env->snake;
     env->pov = action;
+    env->steps++; // was declared and reset but never actually counted anywhere
 }
 
 // Sample discrete action from softmax probability distribution
@@ -293,18 +319,67 @@ ACTION greedy_action(matrix* probs) {
     return (ACTION)best_idx;
 }
 
+// --- Test-time loop breaker -------------------------------------------
+//
+// BUG THIS FIXES: a policy trained with REINFORCE is a *distribution*, and
+// during training actions are sampled from it (sample_action), so even a
+// state where the top action leads nowhere useful is escaped sooner or
+// later by chance -- which is exactly why training shows the agent eating
+// food constantly. run_test_agent instead calls greedy_action, which is
+// perfectly deterministic: for a given state it always returns the same
+// action. Combined with the anti-180-reversal rule in take_action (which
+// removes the snake's one way to "undo" a step), this means that if the
+// argmax choice at some cell points back toward a cell the snake just
+// came from, the snake ends up walking a *fixed loop* -- sometimes a tiny
+// one right next to the food, sometimes a big lap around most of the
+// board -- forever, and dies to the starvation clock having eaten
+// nothing. This is exactly the "just moves and starves" symptom:
+// reproduce it with `./env play` on a fully-trained model and roughly
+// half of episodes end at exactly step 50 (STARVE_LIMIT) with 0 food
+// eaten.
+//
+// Because these loops can be as large as the whole board, trying to
+// detect them by remembering "the last N cells visited" needs N to be
+// unrealistically large to catch every case. The robust fix is simpler:
+// lean on the fact that the *stochastic* policy already reliably finds
+// food (that's what training itself demonstrated). Stay greedy normally
+// -- it's usually the best single action -- but once the snake has gone
+// suspiciously long without eating (well before the hard starvation
+// limit), assume it's stuck in a loop and switch to sampling from the
+// same trained distribution instead of always taking the top pick. A
+// stall threshold well under STARVE_LIMIT gives the sampled policy room
+// to actually recover before the clock runs out.
+
+#define LOOP_STALL_STEPS (STARVE_LIMIT / 4)
+
+ACTION test_time_action(SnakeENV* env, matrix* probs) {
+    if (env->steps_since_food >= LOOP_STALL_STEPS) {
+        return sample_action(probs); // likely stuck in a deterministic loop -- shake it loose
+    }
+    return greedy_action(probs);
+}
+
 // One-hot encode snake, food, and orientation into input tensor
+//
+// BUG FIXED HERE: the y-coordinate bounds checks below used to compare
+// against `cols` instead of `rows`. It never bit anyone because
+// create_env() only ever builds square grids (rows == cols), but it was a
+// landmine for the day someone passes a rectangular grid_size -- the y
+// check would silently pass or fail using the wrong axis's size, letting
+// an out-of-bounds y slip through (or a valid one get rejected), corrupting
+// the one-hot input the network sees. Taking `rows` as its own parameter
+// makes the function correct regardless of grid shape.
 void build_state_vector(
     matrix* in, State state, State food_state,
-    ACTION pov, u32 cols, u32 grid_size
+    ACTION pov, u32 rows, u32 cols, u32 grid_size
 ) {
     clear(in);
 
-    if (state.x >= 0 && state.x < (i32)cols && state.y >= 0 && state.y < (i32)cols) {
+    if (state.x >= 0 && state.x < (i32)cols && state.y >= 0 && state.y < (i32)rows) {
         u32 snake_i = (u32)state.y * cols + (u32)state.x;
         in->data[snake_i] = 1.0f;
     }
-    if (food_state.x >= 0 && food_state.x < (i32)cols && food_state.y >= 0 && food_state.y < (i32)cols) {
+    if (food_state.x >= 0 && food_state.x < (i32)cols && food_state.y >= 0 && food_state.y < (i32)rows) {
         u32 food_i = (u32)food_state.y * cols + (u32)food_state.x;
         in->data[grid_size + food_i] = 1.0f;
     }
@@ -356,18 +431,18 @@ void run_test_agent(model_state* model, SnakeENV* env, u32 episodes) {
     
     for (u32 ep = 0; ep < episodes; ep++) {
         reset_state(env);
-        
+
         for (u32 step = 0; step < 100; step++) {
             render_env(env);
             sleep_ms(300);
 
             build_state_vector(
                 model->input->val, env->snake, env->food,
-                env->pov, env->cols, env->grid_size
+                env->pov, env->rows, env->cols, env->grid_size
             );
 
             forward_pass(&model->forward_graph);
-            ACTION action = greedy_action(model->output->val);
+            ACTION action = test_time_action(env, model->output->val);
             
             State old_snake = env->snake; // Capture before moving
             take_action(env, action);
@@ -445,7 +520,7 @@ void train(model_state* model, SnakeENV* env) {
 
                 build_state_vector(
                     model->input->val, state, food_state,
-                    pov, env->cols, env->grid_size
+                    pov, env->rows, env->cols, env->grid_size
                 );
 
                 forward_pass(&model->forward_graph);
@@ -507,7 +582,7 @@ void train(model_state* model, SnakeENV* env) {
             for (u32 t = 0; t < traj->len; t++) {
                 build_state_vector(
                     model->input->val, traj->states[t], traj->food_states[t],
-                    traj->povs[t], env->cols, env->grid_size
+                    traj->povs[t], env->rows, env->cols, env->grid_size
                 );
 
                 clear(model->advantage->val);
